@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.task_specific_layers import TaskBasicBlock, TaskConv2d, TaskBatchNorm2d, TaskSABlock
+from models.task_specific_layers import TaskBasicBlock, TaskConv2d, TaskBatchNorm2d
 
-import pdb
+from pac.pac import packernel2d
+
 from termcolor import colored
-from depth_normal_fuse.depth2normal_light import Depth2normalLight
+
+from depth_normal_conversion.adaptive_depth2normal import AdaptiveDepth2normal
 
 
 class Normalize(nn.Module):
@@ -73,24 +75,57 @@ class DepthLayer(nn.Module):
         return x
 
 
-class NormalLayer(nn.Module):
-    def __init__(self, input_channels):
-        super(NormalLayer, self).__init__()
+class DepthNormalConversion(nn.Module):
+    def __init__(self, k_size, dilation, sample_num=40):
+        super(DepthNormalConversion, self).__init__()
+        self.k_size = k_size
+        self.dilation = dilation
 
-        self.pred = TaskConv2d(input_channels, 3, 1, task="normals")
-        self.normalize = Normalize()
+        self.depth2norm = AdaptiveDepth2normal(k_size=k_size, dilation=dilation, sample_num=sample_num)
 
-    def forward(self, x):
-        x = self.pred(x)
-        x = self.normalize(x)
+    def compute_kernel(self, input_for_kernel, input_mask=None):
+        return compute_kernel(input_for_kernel, input_mask,
+                              kernel_size=self.k_size,
+                              dilation=self.dilation,
+                              padding=self.dilation * (self.k_size - 1) // 2)[0]
 
-        return x
+    def forward(self, init_depth, intrinsic, guidance=None, if_area=True, if_pa=True):
 
+        if guidance is not None:
+            guide_weight = self.compute_kernel(guidance)  # [B, 1, K, K, H, W]
+            B, C, K1, K2, H, W = guide_weight.shape
+
+            # smooth the kernel; otherwise, the distribution is too sharp
+            ones_constant = torch.ones_like(guide_weight).type_as(guide_weight).to(guide_weight.device) / (K1 * K2)
+            guide_weight = guide_weight + ones_constant
+            norm = guide_weight.sum(dim=2, keepdim=True).sum(dim=3, keepdim=True)
+            guide_weight = guide_weight / norm * (K1 * K2)  # scale to larger values
+
+            guide_weight = guide_weight.squeeze(1).permute(0, 3, 4, 1, 2).contiguous()  # [B, H, W, K, K]
+            B, H, W, K, K = guide_weight.shape
+            guide_weight = guide_weight.view(B, H, W, K * K)
+        else:
+            guide_weight = None
+
+        estimate_normal, _ = self.depth2norm(init_depth, intrinsic, guide_weight, if_area=if_area, if_pa=if_pa)
+
+        return estimate_normal
+
+
+def task_conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1, task='shared'):
+    """3x3 convolution with padding"""
+    return TaskConv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                      padding=dilation, groups=groups, bias=False, dilation=dilation, task=task)
+
+
+def task_conv1x1(in_planes, out_planes, stride=1, task='shared'):
+    """1x1 convolution"""
+    return TaskConv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False, task=task)
 
 
 def compute_kernel(input_for_kernel, input_mask=None, kernel_size=3, stride=1, padding=1, dilation=1,
                    kernel_type='gaussian', smooth_kernel_type='none', normalize_kernel=True):
-    return kernel2d(input_for_kernel, input_mask,
+    return packernel2d(input_for_kernel, input_mask,
                        kernel_size=kernel_size, stride=stride, padding=padding,
                        dilation=dilation, kernel_type=kernel_type,
                        smooth_kernel_type=smooth_kernel_type,
@@ -103,32 +138,32 @@ def compute_kernel(input_for_kernel, input_mask=None, kernel_size=3, stride=1, p
                        native_impl=None)
 
 
-class GeoDepthNet(nn.Module):
+class AsnDepthNet(nn.Module):
     """
     Depth estimation Network with pixel adaptive surface normal constraint
     output 1/2 size estimated depth compared with input image
     """
 
     def __init__(self, p, backbone, backbone_channels, max_depth=10.):
-        super(GeoDepthNet, self).__init__()
+        super(AsnDepthNet, self).__init__()
         # General
         self.tasks = p.TASKS.NAMES
         self.auxilary_tasks = p.AUXILARY_TASKS.NAMES
         self.num_scales = len(backbone_channels)
-        
-        if 'resnet' in p['backbone']:
-            self.task_channels = [x//4 for x in backbone_channels]
-        else:
-            self.task_channels = backbone_channels
+
+        self.task_channels = backbone_channels
+
         print("task_channels: ", self.task_channels)
         self.channels = backbone_channels
         self.max_depth = p['max_depth'] if 'max_depth' in p.keys() else max_depth
 
-        self.use_gt_depth = p['use_gt_depth'] if 'use_gt_depth' in p.keys() else False
         self.use_guidance = p['use_guidance'] if 'use_guidance' in p.keys() else False
         self.guidance_reduce = p['guidance_reduce'] if 'guidance_reduce' in p.keys() else False
 
         self.normal_loss = p['normal_loss'] if 'normal_loss' in p.keys() else False
+
+        self.pasn_if_area = p['pasn_if_area'] if 'pasn_if_area' in p.keys() else True
+        self.pasn_if_pa = p['pasn_if_pa'] if 'pasn_if_pa' in p.keys() else True
 
         # Backbone
         self.backbone = backbone
@@ -167,31 +202,15 @@ class GeoDepthNet(nn.Module):
         # Depth Normal conversion modules
         k_size = p['k_size'] if 'k_size' in p.keys() else 5
         sample_num = p['sample_num'] if 'sample_num' in p.keys() else 40
+
+        print(colored("************************************", 'red'))
+        print("pasn_if_area", self.pasn_if_area)
+        print("pasn_if_pa", self.pasn_if_pa)
+        print("k_size", k_size)
+        print("sample_num", sample_num)
+        print(colored("************************************", 'red'))
         self.scale_0_conversion = DepthNormalConversion(k_size=k_size, dilation=1,
-                                                       sample_num=sample_num)  # Depth2NormalLight
-
-    def set_task_specific_parameters_trainable(self, task):
-        for param in self.parameters():
-            param.requires_grad = False  # first set all parameters to False
-
-        # now set task-specific parameters to True
-        for m in self.modules():
-            if isinstance(m, TaskConv2d) or isinstance(m, TaskBatchNorm2d) or isinstance(m, PacConv2d):
-                if m.task == task:
-                    for param in m.parameters():
-                        param.requires_grad = True
-
-        for param in self.heads[task].parameters():
-            param.requires_grad = True
-
-    def print_trainable_parameters(self):
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                print(colored(name, 'green'))
-        print("-----------------------------------------------------------------")
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                print(colored(name, 'magenta'))
+                                                        sample_num=sample_num)  # Depth2NormalLight
 
     def scale_intrinsic(self, intrinsic, scale_x, scale_y):
         intrinsic = intrinsic.clone()
@@ -202,9 +221,7 @@ class GeoDepthNet(nn.Module):
         # print(intrinsic)
         return intrinsic
 
-    def forward(self, x, intrinsic, gt_depth=None):
-        # pdb.set_trace()
-
+    def forward(self, x, intrinsic):
         img_size = x.size()[-2:]
         img_H, img_W = img_size[0], img_size[1]
 
@@ -245,20 +262,14 @@ class GeoDepthNet(nn.Module):
         else:
             x_0_guidance = None
 
+
         # scale intrinsic
         _, _, scale_0_H, scale_0_W = x_0_depth.shape
         scale_0_intrinsic = self.scale_intrinsic(intrinsic, scale_x=scale_0_W / img_W, scale_y=scale_0_H / img_H)
 
         if self.normal_loss:
-            if not self.use_gt_depth or gt_depth is None:
-                #             print("not use gt_depth")
-                x_0_converted_normals = self.scale_0_conversion(
+            x_0_converted_normals = self.scale_0_conversion(
                     x_0_depth, scale_0_intrinsic, x_0_guidance)
-            else:
-                #             print("use gt_depth")
-                gt_depth = F.interpolate(gt_depth, (scale_0_H, scale_0_W), mode='bilinear')
-                x_0_converted_normals = self.scale_0_conversion(
-                    gt_depth, scale_0_intrinsic, x_0_guidance)
 
             x_0_converted_normals = F.interpolate(x_0_converted_normals, img_size, mode='bilinear')
         else:
