@@ -98,7 +98,7 @@ class AdaptiveDepth2normal(nn.Module):
             p3_y = p3 // self.k_size
 
             # use cross product to calculate triangles' area, dot product should use two vectors (<90 degree)
-            area = (p2_x - p1_x) * (p3_y - p1_y) - (p2_y - p1_y) * (p3_x - p1_x) / 2
+            area = (p2_x - p1_x) * (p3_y - p1_y) - (p2_y - p1_y) * (p3_x - p1_x) 
 
             if area > self.area_thred:
                 valid_list.append([p1, p2, p3])
